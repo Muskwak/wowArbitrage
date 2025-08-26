@@ -548,6 +548,7 @@ local VendorSellPriceCache = {
   ["9358"] = 228,
   ["9360"] = 400,
   ["9361"] = 400,
+  ["9367"] = 1250,
   ["10050"] = 2500,
   ["10051"] = 2500,
   ["10285"] = 1000,
@@ -1029,6 +1030,7 @@ local VendorSellPriceCache = {
   ["17033"] = 500,
   ["17036"] = 200,
   ["17037"] = 350,
+  ["17038"] = 500,
   ["17062"] = 550,
   ["17203"] = 1000,
   ["17222"] = 300,
@@ -6411,6 +6413,7 @@ local VendorSellPriceCache = {
   ["162666"] = 7446,
   ["162671"] = 27680,
   ["162674"] = 26405,
+  ["162676"] = 57280,
   ["162677"] = 37685,
   ["162678"] = 126088,
   ["162679"] = 64280,
@@ -10790,6 +10793,7 @@ local VendorSellPriceCache = {
   ["239692"] = 500,
   ["240194"] = 30000,
   ["240216"] = 10000,
+  ["243016"] = 100000,
   ["243145"] = 100000,
   ["243160"] = 100000,
   ["243161"] = 100000,
@@ -10847,8 +10851,8 @@ local function VendorSellPrice(itemID)
     return VendorSellPriceCache[tostring(itemID)] or 0
 end
 
--- validatePriceCache verifies each cached sell price matches the actual sell price
-local function validatePriceCache()
+-- ValidatePriceCache verifies each cached sell price matches the actual sell price
+local function ValidatePriceCache()
     for itemID, cachedPrice in pairs(VendorSellPriceCache) do
         itemID = tonumber(itemID)
         local item = Item:CreateFromItemID(itemID)
@@ -10857,16 +10861,14 @@ local function validatePriceCache()
                     local itemInfo = { C_Item.GetItemInfo(itemID) }
                     local sellPrice = itemInfo[11]
                     if cachedPrice ~= sellPrice then
-                        AhaUtil.PrettyPrint("Cached price mismatch!", itemID, GetCoinTextureString(cachedPrice), "~=", GetCoinTextureString(sellPrice))
+                        MerchUtil.PrettyPrint("Cached price mismatch!", itemID, GetCoinTextureString(cachedPrice), "~=", GetCoinTextureString(sellPrice))
                     end
                 end
         )
     end
 end
 
--- Validate the sell price cache
-C_Timer.After(1, validatePriceCache)
-
-AhaPriceCache = {
+PriceCache = {
+  ValidatePriceCache = ValidatePriceCache,
   VendorSellPrice = VendorSellPrice,
 }

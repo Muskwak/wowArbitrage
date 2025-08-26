@@ -30,3 +30,7 @@ AhaUtil = {
     PrettyPrint = PrettyPrint,
     Version = Version,
 }
+--PriceCache.lua references PrettyPrint via the MerchUtil module
+MerchUtil = {
+    PrettyPrint = PrettyPrint,
+}

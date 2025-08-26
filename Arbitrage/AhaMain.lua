@@ -10,7 +10,7 @@ local function FindArbitrages(firstAuction, numAuctions)
     -- search for the function in the global namespace once,
     -- instead of on every call.
     local getReplicateItemInfo = C_AuctionHouse.GetReplicateItemInfo
-    local vendorSellPrice = AhaPriceCache.VendorSellPrice
+    local vendorSellPrice = PriceCache.VendorSellPrice
     local foundArbitrage = false
 
     for i = firstAuction, numAuctions-1 do
