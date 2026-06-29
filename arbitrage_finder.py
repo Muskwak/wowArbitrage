@@ -7,9 +7,9 @@ listed on the AH below their vendor sell price across all servers.
 
 Usage:
     1. Get an API key at https://undermine.exchange/ (free, sign in with Patreon)
-    2. Run: python arbitrage_finder.py --api-key YOUR_KEY --region us
+    2. python arbitrage_finder.py --api-key KEY --region us
 
-To expand the vendor price database:
+To expand vendor prices:
     python arbitrage_finder.py --api-key KEY --fetch-vendor-prices --blizzard-id ID --blizzard-secret SECRET
 """
 
@@ -19,29 +19,17 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import gzip
-from collections import defaultdict
 from dataclasses import dataclass, asdict
 from typing import Optional
 
 API_BASE = "https://api.undermine.exchange"
 VENDOR_PRICE_FILE = os.path.join(os.path.dirname(__file__), "vendor_prices.json")
 PRICE_CACHE_LUA = os.path.join(os.path.dirname(__file__), "Arbitrage", "PriceCache.lua")
-
-
-@dataclass
-class Arbitrage:
-    item_id: int
-    vendor_price: int
-    ah_price: int
-    quantity: int
-    realms: list[str]
-    profit_per_item: int
-    total_profit: int
-    margin_pct: float
 
 
 def load_vendor_prices() -> dict[int, int]:
@@ -52,8 +40,8 @@ def load_vendor_prices() -> dict[int, int]:
     if os.path.exists(PRICE_CACHE_LUA):
         with open(PRICE_CACHE_LUA) as f:
             for match in re.finditer(r'\["(\d+)"\]\s*=\s*(\d+)', f.read()):
-                item_id, price = int(match.group(1)), int(match.group(2))
-                prices.setdefault(item_id, price)
+                iid, price = int(match.group(1)), int(match.group(2))
+                prices.setdefault(iid, price)
     return prices
 
 
@@ -61,60 +49,11 @@ def save_vendor_prices(prices: dict[int, int]):
     os.makedirs(os.path.dirname(VENDOR_PRICE_FILE), exist_ok=True)
     with open(VENDOR_PRICE_FILE, "w") as f:
         json.dump(dict(sorted(prices.items())), f, indent=2)
-    print(f"  Saved {len(prices)} vendor prices")
-
-
-def fetch_blizzard_vendor_prices(client_id: str, client_secret: str) -> dict[int, int]:
-    """Scrape item IDs with vendor prices from Blizzard's static data."""
-    print("Fetching vendor prices from Blizzard API...")
-    token_data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
-    req = urllib.request.Request("https://oauth.battle.net/token", data=token_data)
-    req.add_header("Authorization", f"Basic {base64.b64encode(f'{client_id}:{client_secret}'.encode()).decode()}")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-
-    try:
-        with urllib.request.urlopen(req) as resp:
-            token = json.load(resp)["access_token"]
-    except Exception as e:
-        print(f"  Blizzard auth failed: {e}")
-        return {}
-
-    headers = {"Authorization": f"Bearer {token}"}
-    prices = {}
-    found = 0
-    batch_size = 100
-
-    for start in range(1, 250000, batch_size):
-        ids_param = ",".join(str(i) for i in range(start, start + batch_size))
-        url = f"https://us.api.blizzard.com/data/wow/item?ids={ids_param}&namespace=static-us&locale=en_US"
-
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req) as resp:
-                for item in json.load(resp).get("items", []):
-                    sp = item.get("sell_price")
-                    if sp and sp > 0:
-                        prices[item["id"]] = sp
-                        found += 1
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                print("  Rate limited, sleeping...")
-                import time
-                time.sleep(60)
-                continue
-            if e.code != 404:
-                print(f"  Error at {start}: {e}")
-
-        if start % 10000 == 1:
-            print(f"  Scanned items up to {start}, found {found} vendor prices...")
-
-    print(f"  Found {len(prices)} items with vendor prices")
-    return prices
+    print(f"  Saved {len(prices)} vendor prices to {VENDOR_PRICE_FILE}")
 
 
 def ue_get(path: str, api_key: str) -> dict:
-    url = f"{API_BASE}{path}"
-    req = urllib.request.Request(url)
+    req = urllib.request.Request(f"{API_BASE}{path}")
     req.add_header("Authorization", f"ApiKey {api_key}")
     req.add_header("Accept-Encoding", "gzip")
     try:
@@ -133,13 +72,82 @@ def ue_get(path: str, api_key: str) -> dict:
         sys.exit(1)
 
 
+def get_blizzard_token(client_id: str, client_secret: str) -> str:
+    data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+    req = urllib.request.Request("https://oauth.battle.net/token", data=data)
+    req.add_header("Authorization", f"Basic {base64.b64encode(f'{client_id}:{client_secret}'.encode()).decode()}")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req) as resp:
+        return json.load(resp)["access_token"]
+
+
+def get_blizzard_sell_price(item_id: int, token: str) -> Optional[int]:
+    """Get vendor sell price for a single item from Blizzard API."""
+    url = f"https://us.api.blizzard.com/data/wow/item/{item_id}?namespace=static-us&locale=en_US"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.load(resp)
+            return data.get("sell_price")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def fetch_vendor_prices_from_ah(api_key: str, region: str,
+                                 client_id: str, client_secret: str) -> dict[int, int]:
+    """
+    Smart vendor price fetch: only look up items that actually appear on the AH.
+    Uses UE commodities data to get the list of active items, then queries
+    Blizzard API only for those missing vendor prices.
+    """
+    token = get_blizzard_token(client_id, client_secret)
+    existing = load_vendor_prices()
+    print(f"  Already have {len(existing)} vendor prices")
+
+    # Get all item IDs currently on the AH from UE
+    print(f"  Fetching active AH items from Undermine Exchange...")
+    comms = ue_get(f"/v1/region/{region}/commodities.json", api_key)
+    ah_item_ids = set(int(k) for k in comms["result"]["commodities"].keys())
+
+    print(f"  {len(ah_item_ids)} commodities currently on the AH")
+    missing = [iid for iid in sorted(ah_item_ids) if iid not in existing]
+    print(f"  {len(missing)} items need vendor price lookup")
+
+    if not missing:
+        print("  All items already have vendor prices!")
+        return existing
+
+    found = 0
+    for i, iid in enumerate(missing):
+        try:
+            sp = get_blizzard_sell_price(iid, token)
+            if sp and sp > 0:
+                existing[iid] = sp
+                found += 1
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print("  Rate limited, sleeping 10s...")
+                time.sleep(10)
+                continue
+        except Exception:
+            pass
+
+        if (i + 1) % 50 == 0:
+            print(f"  {i + 1}/{len(missing)} checked, {found} new prices found")
+        time.sleep(0.1)  # avoid rate limiting
+
+    print(f"  Found {found} new vendor prices ({len(existing)} total)")
+    save_vendor_prices(existing)
+    return existing
+
+
 def copper_str(copper: int) -> str:
     g, r = divmod(copper, 10000)
     s, c = divmod(r, 100)
-    if g:
-        return f"{g}g {s}s {c}c"
-    if s:
-        return f"{s}s {c}c"
+    if g: return f"{g}g {s}s {c}c"
+    if s: return f"{s}s {c}c"
     return f"{c}c"
 
 
@@ -152,11 +160,12 @@ def main():
     parser.add_argument("--blizzard-id")
     parser.add_argument("--blizzard-secret")
     parser.add_argument("--fetch-vendor-prices", action="store_true",
-                        help="Fetch missing vendor prices from Blizzard API")
+                        help="Fetch missing vendor prices from Blizzard API (only for items on AH)")
     parser.add_argument("--check-items", nargs="+", type=int,
                         help="Check specific item IDs instead of full scan")
     args = parser.parse_args()
 
+    # Load vendor prices
     vendor_prices = load_vendor_prices()
     print(f"Loaded {len(vendor_prices)} vendor sell prices")
 
@@ -164,103 +173,94 @@ def main():
         if not args.blizzard_id or not args.blizzard_secret:
             print("Error: --blizzard-id and --blizzard-secret required")
             sys.exit(1)
-        new = fetch_blizzard_vendor_prices(args.blizzard_id, args.blizzard_secret)
-        vendor_prices.update(new)
-        save_vendor_prices(vendor_prices)
+        fetch_vendor_prices_from_ah(args.api_key, args.region,
+                                     args.blizzard_id, args.blizzard_secret)
         return
 
-    print(f"Fetching region-wide commodity prices for {args.region}...")
+    # Fetch region-wide commodity prices
+    print(f"Fetching commodity prices for {args.region}...")
     data = ue_get(f"/v1/region/{args.region}/commodities.json", args.api_key)
     commodities = data["result"]["commodities"]
-    print(f"  Got {len(commodities)} commodities")
+    print(f"  {len(commodities)} commodities tracked")
+
+    # Find candidates where region-min price < vendor price
+    candidates = {}
+    for id_str, info in commodities.items():
+        iid = int(id_str)
+        vp = vendor_prices.get(iid)
+        if not vp or vp <= 0:
+            continue
+        ap = info.get("price", 0)
+        q = info.get("quantity", 0)
+        if ap > 0 and q > 0 and ap < vp:
+            candidates[iid] = {"vendor_price": vp, "ah_price": ap, "quantity": q}
 
     if args.check_items:
-        candidates = {}
-        for iid in args.check_items:
-            info = commodities.get(str(iid))
-            if info:
-                vp = vendor_prices.get(iid)
-                if vp and vp > 0:
-                    candidates[iid] = {"vendor_price": vp, "ah_price": info.get("price", 0), "quantity": info.get("quantity", 0)}
-        print(f"  {len(candidates)} target items with vendor prices")
-    else:
-        candidates = {}
-        for id_str, info in commodities.items():
-            iid = int(id_str)
-            vp = vendor_prices.get(iid)
-            if vp and vp > 0:
-                ap = info.get("price", 0)
-                q = info.get("quantity", 0)
-                if ap > 0 and q > 0 and ap < vp:
-                    candidates[iid] = {"vendor_price": vp, "ah_price": ap, "quantity": q}
-        print(f"  {len(candidates)} items below vendor price region-wide")
+        candidates = {iid: candidates[iid] for iid in args.check_items if iid in candidates}
+    print(f"  {len(candidates)} items below vendor price region-wide")
 
     if not candidates:
         print("\nNo opportunities found. Try --fetch-vendor-prices to expand database.")
         return
 
-    print(f"\nFetching per-realm pricing for {len(candidates)} candidates...")
-    opportunities = []
-
+    # Get per-realm-group pricing for each candidate
+    print(f"Fetching per-realm pricing...")
+    results = []
     for i, (iid, cinfo) in enumerate(candidates.items()):
         try:
             now = ue_get(f"/v1/region/{args.region}/commodities/{iid}/now.json", args.api_key)
         except Exception:
             continue
 
-        groups = now.get("result", [])
-        if not groups:
-            continue
-
-        best = groups[0]
-        ap = best.get("price", 0)
-        qty = best.get("quantity", 0)
-        realms = best.get("realms", [])
-        vp = cinfo["vendor_price"]
-
-        if ap > 0 and qty > 0 and ap < vp:
-            opportunities.append(Arbitrage(
-                item_id=iid,
-                vendor_price=vp,
-                ah_price=ap,
-                quantity=qty,
-                realms=realms,
-                profit_per_item=vp - ap,
-                total_profit=(vp - ap) * qty,
-                margin_pct=((vp - ap) / ap) * 100,
-            ))
+        for group in now.get("result", []):
+            ap = group.get("price", 0)
+            qty = group.get("quantity", 0)
+            realms = group.get("realms", [])
+            vp = cinfo["vendor_price"]
+            if ap > 0 and qty > 0 and ap < vp:
+                results.append({
+                    "item_id": iid,
+                    "vendor_price": vp,
+                    "ah_price": ap,
+                    "quantity": qty,
+                    "realms": realms,
+                    "profit_per_item": vp - ap,
+                    "total_profit": (vp - ap) * qty,
+                    "margin_pct": round(((vp - ap) / ap) * 100, 1),
+                })
 
         if (i + 1) % 25 == 0:
-            print(f"  Checked {i + 1}/{len(candidates)}...")
+            print(f"  {i + 1}/{len(candidates)} checked ({len(results)} opportunities found)")
 
-    opportunities.sort(key=lambda o: o.total_profit, reverse=True)
-    opportunities = [o for o in opportunities if o.profit_per_item >= args.min_profit][:args.max_results]
+    results.sort(key=lambda o: o["total_profit"], reverse=True)
+    results = [o for o in results if o["profit_per_item"] >= args.min_profit][:args.max_results]
 
-    if not opportunities:
-        print("\nNo qualifying opportunities after per-realm check.")
+    if not results:
+        print("\nNo qualifying opportunities.")
         return
 
-    print(f"\n{'='*120}")
+    print(f"\n{'='*130}")
     print(f"VENDOR ARBITRAGE - {args.region.upper()}")
-    print(f"{'='*120}")
-    header = f"{'Item ID':<10} {'AH Price':<14} {'Vendor':<14} {'Profit/ea':<14} {'Qty':<8} {'Total':<14} {'Margin':<8} {'Realms'}"
-    print(header)
-    print("-" * 120)
+    print(f"{'='*130}")
+    print(f"{'ID':<8} {'AH Price':<14} {'Vendor':<14} {'Profit/ea':<14} {'Qty':<8} {'Total':<14} {'Margin':<8} {'Realms'}")
+    print("-" * 130)
 
-    all_total = 0
-    for o in opportunities:
-        all_total += o.total_profit
-        realms_str = ", ".join(o.realms[:4])
-        if len(o.realms) > 4:
-            realms_str += f" (+{len(o.realms) - 4} more)"
-        print(f"{o.item_id:<10} {copper_str(o.ah_price):<14} {copper_str(o.vendor_price):<14} {copper_str(o.profit_per_item):<14} {o.quantity:<8} {copper_str(o.total_profit):<14} {o.margin_pct:>6.1f}%  {realms_str}")
+    grand_total = 0
+    for o in results:
+        grand_total += o["total_profit"]
+        r = o["realms"][:4]
+        if len(o["realms"]) > 4:
+            r.append(f"+{len(o['realms'])-4}")
+        print(f"{o['item_id']:<8} {copper_str(o['ah_price']):<14} {copper_str(o['vendor_price']):<14} "
+              f"{copper_str(o['profit_per_item']):<14} {o['quantity']:<8} "
+              f"{copper_str(o['total_profit']):<14} {o['margin_pct']:>6.1f}%  {', '.join(r)}")
 
-    print("-" * 120)
-    print(f"{'Total profit:':<60} {copper_str(all_total)}")
+    print("-" * 130)
+    print(f"{'Total potential profit:':<70} {copper_str(grand_total)}")
 
     out = f"arbitrage_{args.region}.json"
     with open(out, "w") as f:
-        json.dump([asdict(o) for o in opportunities], f, indent=2)
+        json.dump(results, f, indent=2)
     print(f"\nSaved to {out}")
 
 
