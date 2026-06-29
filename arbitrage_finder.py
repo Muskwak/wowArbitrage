@@ -3,11 +3,17 @@
 Cross-server vendor arbitrage finder for World of Warcraft.
 
 Uses Undermine Exchange API (free with Patreon login) to find items
-listed on the AH below their vendor sell price across all servers.
+listed on the AH below their vendor sell price across US/EU/KR/TW.
+
+NOTE: The UE API only exposes per-realm data for NON-commodity items
+(gear, weapons, etc.). For commodities (trade goods, reagents, etc.),
+only region-wide minimum prices are available. To find which specific
+realm has the best commodity price, check https://undermine.exchange/
 
 Usage:
-    1. Get an API key at https://undermine.exchange/ (free, sign in with Patreon)
+    1. Get API key at https://undermine.exchange/ (free, sign in with Patreon)
     2. python arbitrage_finder.py --api-key KEY --region us
+    3. python arbitrage_finder.py --api-key KEY --region us --check-items 221754
 
 To expand vendor prices:
     python arbitrage_finder.py --api-key KEY --fetch-vendor-prices --blizzard-id ID --blizzard-secret SECRET
@@ -25,7 +31,6 @@ import urllib.parse
 import urllib.request
 import gzip
 from dataclasses import dataclass, asdict
-from typing import Optional
 
 API_BASE = "https://api.undermine.exchange"
 VENDOR_PRICE_FILE = os.path.join(os.path.dirname(__file__), "vendor_prices.json")
@@ -83,9 +88,6 @@ def get_blizzard_token(client_id: str, client_secret: str) -> str:
 
 def fetch_vendor_prices_from_ah(api_key: str, region: str,
                                  client_id: str, client_secret: str) -> dict[int, int]:
-    """
-    Smart vendor price fetch: batch-lookup missing vendor prices for items on the AH.
-    """
     token = get_blizzard_token(client_id, client_secret)
     existing = load_vendor_prices()
     print(f"  Already have {len(existing)} vendor prices")
@@ -140,39 +142,17 @@ def copper_str(copper: int) -> str:
     return f"{c}c"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="WoW cross-server vendor arbitrage finder")
-    parser.add_argument("--api-key", required=True, help="Undermine Exchange API key")
-    parser.add_argument("--region", default="us", choices=["us", "eu", "tw", "kr"])
-    parser.add_argument("--min-profit", type=int, default=10000, help="Min profit per item in copper (default: 1g)")
-    parser.add_argument("--max-results", type=int, default=50)
-    parser.add_argument("--blizzard-id")
-    parser.add_argument("--blizzard-secret")
-    parser.add_argument("--fetch-vendor-prices", action="store_true",
-                        help="Fetch missing vendor prices from Blizzard API (only for items on AH)")
-    parser.add_argument("--check-items", nargs="+", type=int,
-                        help="Check specific item IDs instead of full scan")
-    args = parser.parse_args()
-
-    # Load vendor prices
-    vendor_prices = load_vendor_prices()
-    print(f"Loaded {len(vendor_prices)} vendor sell prices")
-
-    if args.fetch_vendor_prices:
-        if not args.blizzard_id or not args.blizzard_secret:
-            print("Error: --blizzard-id and --blizzard-secret required")
-            sys.exit(1)
-        fetch_vendor_prices_from_ah(args.api_key, args.region,
-                                     args.blizzard_id, args.blizzard_secret)
-        return
-
-    # Fetch region-wide commodity prices
-    print(f"Fetching commodity prices for {args.region}...")
-    data = ue_get(f"/v1/region/{args.region}/commodities.json", args.api_key)
+def region_scan(api_key: str, region: str,
+                vendor_prices: dict[int, int],
+                check_items: list[int] = None,
+                min_profit: int = 10000,
+                max_results: int = 50) -> list[dict]:
+    """Region-wide scan to find items below vendor price."""
+    print(f"Fetching commodity prices for {region}...")
+    data = ue_get(f"/v1/region/{region}/commodities.json", api_key)
     commodities = data["result"]["commodities"]
     print(f"  {len(commodities)} commodities tracked")
 
-    # Find candidates where region-min price < vendor price
     candidates = {}
     for id_str, info in commodities.items():
         iid = int(id_str)
@@ -184,20 +164,19 @@ def main():
         if ap > 0 and q > 0 and ap < vp:
             candidates[iid] = {"vendor_price": vp, "ah_price": ap, "quantity": q}
 
-    if args.check_items:
-        candidates = {iid: candidates[iid] for iid in args.check_items if iid in candidates}
+    if check_items:
+        candidates = {iid: candidates[iid] for iid in check_items if iid in candidates}
     print(f"  {len(candidates)} items below vendor price region-wide")
 
     if not candidates:
-        print("\nNo opportunities found. Try --fetch-vendor-prices to expand database.")
-        return
+        print("\nNo opportunities found.")
+        return []
 
-    # Get per-item detail for each candidate
     print(f"Fetching item-level pricing...")
     results = []
     for i, (iid, cinfo) in enumerate(candidates.items()):
         try:
-            now = ue_get(f"/v1/region/{args.region}/commodities/{iid}/now.json", args.api_key)
+            now = ue_get(f"/v1/region/{region}/commodities/{iid}/now.json", api_key)
         except Exception:
             continue
         info = now.get("result", {})
@@ -220,35 +199,147 @@ def main():
             print(f"  {i + 1}/{len(candidates)} checked ({len(results)} opportunities found)")
 
     results.sort(key=lambda o: o["total_profit"], reverse=True)
-    results = [o for o in results if o["profit_per_item"] >= args.min_profit][:args.max_results]
+    results = [o for o in results if o["profit_per_item"] >= min_profit][:max_results]
+    return results
+
+
+def check_non_commodity_items(api_key: str, region: str,
+                               vendor_prices: dict[int, int]) -> list[dict]:
+    """Check non-commodity items for vendor arbitrage (these have per-realm data)."""
+    print(f"Fetching non-commodity item summary for {region}...")
+    data = ue_get(f"/v1/region/{region}/items.json", api_key)
+    items = data["result"]["items"]
+
+    # Find candidates from non-commodity items
+    non_comm_candidates = {}
+    for id_str, info in items.items():
+        iid = int(id_str)
+        vp = vendor_prices.get(iid)
+        if not vp or vp <= 0:
+            continue
+        ap = info.get("min", 0)
+        if ap > 0 and ap < vp:
+            non_comm_candidates[iid] = {"vendor_price": vp, "ah_price": ap}
+
+    if not non_comm_candidates:
+        return []
+
+    print(f"  {len(non_comm_candidates)} non-commodity items below vendor price")
+
+    # For each candidate, get per-realm pricing
+    results = []
+    for iid, cinfo in non_comm_candidates.items():
+        try:
+            now = ue_get(f"/v1/region/{region}/items/{iid}/now.json", api_key)
+        except Exception:
+            continue
+
+        for group in now.get("result", []):
+            ap = group.get("price", 0)
+            qty = group.get("quantity", 0)
+            realms = group.get("realms", [])
+            vp = cinfo["vendor_price"]
+            if ap > 0 and qty > 0 and ap < vp:
+                results.append({
+                    "item_id": iid,
+                    "vendor_price": vp,
+                    "ah_price": ap,
+                    "quantity": qty,
+                    "realms": realms,
+                    "profit_per_item": vp - ap,
+                    "total_profit": (vp - ap) * qty,
+                    "margin_pct": round(((vp - ap) / ap) * 100, 1),
+                })
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="WoW cross-server vendor arbitrage finder")
+    parser.add_argument("--api-key", required=True, help="Undermine Exchange API key")
+    parser.add_argument("--region", default="us", choices=["us", "eu", "tw", "kr"])
+    parser.add_argument("--min-profit", type=int, default=10000, help="Min profit per item in copper (default: 1g)")
+    parser.add_argument("--max-results", type=int, default=50)
+    parser.add_argument("--blizzard-id")
+    parser.add_argument("--blizzard-secret")
+    parser.add_argument("--fetch-vendor-prices", action="store_true",
+                        help="Fetch missing vendor prices from Blizzard API")
+    parser.add_argument("--check-items", nargs="+", type=int,
+                        help="Check specific item IDs")
+    parser.add_argument("--include-non-commodities", action="store_true",
+                        help="Also scan non-commodity items (per-realm data available)")
+    args = parser.parse_args()
+
+    vendor_prices = load_vendor_prices()
+    print(f"Loaded {len(vendor_prices)} vendor sell prices")
+
+    if args.fetch_vendor_prices:
+        if not args.blizzard_id or not args.blizzard_secret:
+            print("Error: --blizzard-id and --blizzard-secret required")
+            sys.exit(1)
+        fetch_vendor_prices_from_ah(args.api_key, args.region,
+                                     args.blizzard_id, args.blizzard_secret)
+        return
+
+    # Region-wide scan
+    results = region_scan(args.api_key, args.region, vendor_prices,
+                          args.check_items, args.min_profit, args.max_results)
 
     if not results:
-        print("\nNo qualifying opportunities.")
         return
 
     print(f"\n{'='*100}")
-    print(f"VENDOR ARBITRAGE - {args.region.upper()} (region-wide min prices)")
+    print(f"VENDOR ARBITRAGE - {args.region.upper()} (commodities)")
     print(f"{'='*100}")
     print(f"{'ID':<8} {'AH Price':<14} {'Vendor':<14} {'Profit/ea':<14} {'Qty':<8} {'Total':<14} {'Margin':<8}")
     print("-" * 100)
-
     grand_total = 0
     for o in results:
         grand_total += o["total_profit"]
         print(f"{o['item_id']:<8} {copper_str(o['ah_price']):<14} {copper_str(o['vendor_price']):<14} "
               f"{copper_str(o['profit_per_item']):<14} {o['quantity']:<8} "
               f"{copper_str(o['total_profit']):<14} {o['margin_pct']:>6.1f}%")
-
     print("-" * 100)
-    print(f"{'Potential profit (region):':<70} {copper_str(grand_total)}")
-    print(f"{'Items found:':<70} {len(results)}")
-    print(f"\n  Prices shown are region-wide minimums. Deal exists on at least one realm.")
-    print(f"  Use --realm to check a specific realm, or check item IDs on undermine.exchange")
+    print(f"{'Total profit:':<70} {copper_str(grand_total)}")
+    print(f"\n  Prices are region-wide minimums. Check undermine.exchange for realm detail.")
 
     out = f"arbitrage_{args.region}.json"
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nSaved to {out}")
+    print(f"Saved {out}")
+
+    # Non-commodity items (have per-realm data)
+    if args.include_non_commodities:
+        nc_results = check_non_commodity_items(args.api_key, args.region, vendor_prices)
+
+        if nc_results:
+            nc_results.sort(key=lambda o: o["total_profit"], reverse=True)
+            nc_results = nc_results[:args.max_results]
+
+            print(f"\n{'='*140}")
+            print(f"NON-COMMODITY ITEMS (per-realm)")
+            print(f"{'='*140}")
+            print(f"{'ID':<8} {'AH Price':<14} {'Vendor':<14} {'Profit/ea':<14} {'Qty':<8} {'Total':<14} {'Margin':<8} {'Realm(s)':<30}")
+            print("-" * 140)
+
+            nc_total = 0
+            for o in nc_results:
+                nc_total += o["total_profit"]
+                r = ", ".join(o["realms"][:3])
+                if len(o["realms"]) > 3:
+                    r += f" (+{len(o['realms'])-3})"
+                print(f"{o['item_id']:<8} {copper_str(o['ah_price']):<14} "
+                      f"{copper_str(o['vendor_price']):<14} {copper_str(o['profit_per_item']):<14} "
+                      f"{o['quantity']:<8} {copper_str(o['total_profit']):<14} "
+                      f"{o['margin_pct']:>6.1f}%  {r:<30}")
+
+            print("-" * 140)
+            print(f"{'Total non-commodity profit:':<70} {copper_str(nc_total)}")
+
+            out_nc = f"arbitrage_{args.region}_items.json"
+            with open(out_nc, "w") as f:
+                json.dump(nc_results, f, indent=2)
+            print(f"Saved {out_nc}")
 
 
 if __name__ == "__main__":
