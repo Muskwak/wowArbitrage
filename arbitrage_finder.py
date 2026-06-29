@@ -81,38 +81,21 @@ def get_blizzard_token(client_id: str, client_secret: str) -> str:
         return json.load(resp)["access_token"]
 
 
-def get_blizzard_sell_price(item_id: int, token: str) -> Optional[int]:
-    """Get vendor sell price for a single item from Blizzard API."""
-    url = f"https://us.api.blizzard.com/data/wow/item/{item_id}?namespace=static-us&locale=en_US"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.load(resp)
-            return data.get("sell_price")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        raise
-
-
 def fetch_vendor_prices_from_ah(api_key: str, region: str,
                                  client_id: str, client_secret: str) -> dict[int, int]:
     """
-    Smart vendor price fetch: only look up items that actually appear on the AH.
-    Uses UE commodities data to get the list of active items, then queries
-    Blizzard API only for those missing vendor prices.
+    Smart vendor price fetch: batch-lookup missing vendor prices for items on the AH.
     """
     token = get_blizzard_token(client_id, client_secret)
     existing = load_vendor_prices()
     print(f"  Already have {len(existing)} vendor prices")
 
-    # Get all item IDs currently on the AH from UE
     print(f"  Fetching active AH items from Undermine Exchange...")
     comms = ue_get(f"/v1/region/{region}/commodities.json", api_key)
-    ah_item_ids = set(int(k) for k in comms["result"]["commodities"].keys())
+    ah_ids = sorted(int(k) for k in comms["result"]["commodities"].keys())
 
-    print(f"  {len(ah_item_ids)} commodities currently on the AH")
-    missing = [iid for iid in sorted(ah_item_ids) if iid not in existing]
+    print(f"  {len(ah_ids)} commodities on AH")
+    missing = [iid for iid in ah_ids if iid not in existing]
     print(f"  {len(missing)} items need vendor price lookup")
 
     if not missing:
@@ -120,23 +103,29 @@ def fetch_vendor_prices_from_ah(api_key: str, region: str,
         return existing
 
     found = 0
-    for i, iid in enumerate(missing):
+    batch_size = 100
+    for i in range(0, len(missing), batch_size):
+        batch = missing[i:i + batch_size]
+        ids_param = ",".join(str(iid) for iid in batch)
+        url = f"https://us.api.blizzard.com/data/wow/item?ids={ids_param}&namespace=static-us&locale=en_US"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         try:
-            sp = get_blizzard_sell_price(iid, token)
-            if sp and sp > 0:
-                existing[iid] = sp
-                found += 1
+            with urllib.request.urlopen(req) as resp:
+                for item in json.load(resp).get("items", []):
+                    sp = item.get("sell_price")
+                    if sp and sp > 0:
+                        existing[item["id"]] = sp
+                        found += 1
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                print("  Rate limited, sleeping 10s...")
-                time.sleep(10)
+                print("  Rate limited, waiting 30s...")
+                time.sleep(30)
                 continue
-        except Exception:
-            pass
+            if e.code != 404:
+                print(f"  Error at batch {i}: {e}")
 
-        if (i + 1) % 50 == 0:
-            print(f"  {i + 1}/{len(missing)} checked, {found} new prices found")
-        time.sleep(0.1)  # avoid rate limiting
+        if (i + batch_size) % 500 == 0 or i + batch_size >= len(missing):
+            print(f"  {min(i + batch_size, len(missing))}/{len(missing)} checked, {found} new prices")
 
     print(f"  Found {found} new vendor prices ({len(existing)} total)")
     save_vendor_prices(existing)
@@ -203,32 +192,30 @@ def main():
         print("\nNo opportunities found. Try --fetch-vendor-prices to expand database.")
         return
 
-    # Get per-realm-group pricing for each candidate
-    print(f"Fetching per-realm pricing...")
+    # Get per-item detail for each candidate
+    print(f"Fetching item-level pricing...")
     results = []
     for i, (iid, cinfo) in enumerate(candidates.items()):
         try:
             now = ue_get(f"/v1/region/{args.region}/commodities/{iid}/now.json", args.api_key)
         except Exception:
             continue
-
-        for group in now.get("result", []):
-            ap = group.get("price", 0)
-            qty = group.get("quantity", 0)
-            realms = group.get("realms", [])
-            vp = cinfo["vendor_price"]
-            if ap > 0 and qty > 0 and ap < vp:
-                results.append({
-                    "item_id": iid,
-                    "vendor_price": vp,
-                    "ah_price": ap,
-                    "quantity": qty,
-                    "realms": realms,
-                    "profit_per_item": vp - ap,
-                    "total_profit": (vp - ap) * qty,
-                    "margin_pct": round(((vp - ap) / ap) * 100, 1),
-                })
-
+        info = now.get("result", {})
+        if isinstance(info, list):
+            info = info[0] if info else {}
+        ap = info.get("price", 0)
+        qty = info.get("quantity", 0)
+        vp = cinfo["vendor_price"]
+        if ap > 0 and qty > 0 and ap < vp:
+            results.append({
+                "item_id": iid,
+                "vendor_price": vp,
+                "ah_price": ap,
+                "quantity": qty,
+                "profit_per_item": vp - ap,
+                "total_profit": (vp - ap) * qty,
+                "margin_pct": round(((vp - ap) / ap) * 100, 1),
+            })
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{len(candidates)} checked ({len(results)} opportunities found)")
 
@@ -239,24 +226,24 @@ def main():
         print("\nNo qualifying opportunities.")
         return
 
-    print(f"\n{'='*130}")
-    print(f"VENDOR ARBITRAGE - {args.region.upper()}")
-    print(f"{'='*130}")
-    print(f"{'ID':<8} {'AH Price':<14} {'Vendor':<14} {'Profit/ea':<14} {'Qty':<8} {'Total':<14} {'Margin':<8} {'Realms'}")
-    print("-" * 130)
+    print(f"\n{'='*100}")
+    print(f"VENDOR ARBITRAGE - {args.region.upper()} (region-wide min prices)")
+    print(f"{'='*100}")
+    print(f"{'ID':<8} {'AH Price':<14} {'Vendor':<14} {'Profit/ea':<14} {'Qty':<8} {'Total':<14} {'Margin':<8}")
+    print("-" * 100)
 
     grand_total = 0
     for o in results:
         grand_total += o["total_profit"]
-        r = o["realms"][:4]
-        if len(o["realms"]) > 4:
-            r.append(f"+{len(o['realms'])-4}")
         print(f"{o['item_id']:<8} {copper_str(o['ah_price']):<14} {copper_str(o['vendor_price']):<14} "
               f"{copper_str(o['profit_per_item']):<14} {o['quantity']:<8} "
-              f"{copper_str(o['total_profit']):<14} {o['margin_pct']:>6.1f}%  {', '.join(r)}")
+              f"{copper_str(o['total_profit']):<14} {o['margin_pct']:>6.1f}%")
 
-    print("-" * 130)
-    print(f"{'Total potential profit:':<70} {copper_str(grand_total)}")
+    print("-" * 100)
+    print(f"{'Potential profit (region):':<70} {copper_str(grand_total)}")
+    print(f"{'Items found:':<70} {len(results)}")
+    print(f"\n  Prices shown are region-wide minimums. Deal exists on at least one realm.")
+    print(f"  Use --realm to check a specific realm, or check item IDs on undermine.exchange")
 
     out = f"arbitrage_{args.region}.json"
     with open(out, "w") as f:
